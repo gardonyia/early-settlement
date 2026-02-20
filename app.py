@@ -55,13 +55,11 @@ def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         key = _norm(col)
         if key in CANON:
             rename_map[col] = CANON[key]
-    out = df.rename(columns=rename_map).copy()
-    return out
+    return df.rename(columns=rename_map).copy()
 
 
 def validate_columns(df: pd.DataFrame) -> list:
-    missing = [c for c in REQUIRED_CANON if c not in df.columns]
-    return missing
+    return [c for c in REQUIRED_CANON if c not in df.columns]
 
 
 def parse_teams_from_event(event: str) -> Tuple[Optional[str], Optional[str]]:
@@ -140,6 +138,16 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     df = df.copy()
 
+    # Normalize fields that commonly contain trailing spaces in exports
+    df["Market"] = df["Market"].astype(str).str.strip()
+    df["Pick"] = df["Pick"].astype(str).str.strip()
+
+    # Work with normalized market for robust matching (handles double spaces etc.)
+    df["_market_norm"] = df["Market"].apply(_norm)
+
+    hda_norm = _norm(HDA_MARKET)
+    super_norm = _norm(SUPER_ODDS_MARKET)
+
     # compute realized profit
     df["Realized Profit (User Currency)"] = df.apply(realized_profit, axis=1)
 
@@ -156,10 +164,9 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     group_cols = ["User ID", "Event"]
 
     def _event_flag(g: pd.DataFrame) -> bool:
-        hda = g[g["Market"] == HDA_MARKET]
+        hda = g[g["_market_norm"] == hda_norm]
         if hda.empty:
             return False
-
         sides = set(hda["_pick_side"].dropna().tolist())
         return ("home" in sides) and ("away" in sides)
 
@@ -183,21 +190,27 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df2 = df.merge(suspicious_events[group_cols], on=group_cols, how="inner")
 
     # Keep only bets on the two relevant markets for reporting.
-    # If a user only played HDA, they'll just have HDA rows here.
-    suspicious_bets = df2[df2["Market"].isin([HDA_MARKET, SUPER_ODDS_MARKET])].copy()
+    suspicious_bets = df2[df2["_market_norm"].isin([hda_norm, super_norm])].copy()
 
     # Build summary (only Won/Lost contribute; others ignored)
     profit_rows = suspicious_bets.dropna(subset=["Realized Profit (User Currency)"]).copy()
 
+    # For pivot readability, use the original configured market names for columns,
+    # but group by normalized market (then map back).
+    profit_rows["_market_label"] = profit_rows["_market_norm"].map({
+        hda_norm: HDA_MARKET,
+        super_norm: SUPER_ODDS_MARKET
+    })
+
     prof = (
-        profit_rows.groupby(["User ID", "User Name", "Market"])["Realized Profit (User Currency)"]
+        profit_rows.groupby(["User ID", "User Name", "_market_label"])["Realized Profit (User Currency)"]
                   .sum()
                   .reset_index()
     )
 
     pivot = prof.pivot_table(
         index=["User ID", "User Name"],
-        columns="Market",
+        columns="_market_label",
         values="Realized Profit (User Currency)",
         fill_value=0.0
     )
@@ -258,7 +271,7 @@ st.set_page_config(page_title="Early Settlement ügyeskedők szűrése", layout=
 st.title("Early Settlement ügyeskedők szűrése")
 st.caption(
     "CSV feltöltés -> gyanús felhasználók és fogadások listázása. "
-    "A flag most már akkor is jár, ha a felhasználó ugyanazon eseményen a HDA piacon fogad hazaira és vendégre is."
+    "A találat feltétele: ugyanazon eseményen a HDA piacon fogadás hazaira és vendégre is."
 )
 
 with st.expander("Mit keresünk pontosan?", expanded=False):
