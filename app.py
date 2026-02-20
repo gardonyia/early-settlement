@@ -133,6 +133,10 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     Returns:
       suspicious_bets_df: bets belonging to users/events that match the pattern
       summary_df: per-user market profit summary
+
+    Flag rules (event-level, per user):
+      - Flag if on the HDA market the user placed BOTH 'home' and 'away' picks
+        for the same event. (Super Odds is optional.)
     """
     df = df.copy()
 
@@ -148,59 +152,38 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         classify_pick(p, h, a) for p, h, a in zip(df["Pick"], df["_home_team"], df["_away_team"])
     ]
 
-    # Identify users who played on both markets at all
-    user_markets = (
-        df.groupby("User ID")["Market"]
-          .agg(lambda s: set(s.dropna().astype(str)))
-    )
-    users_both = set(user_markets[user_markets.apply(lambda s: (HDA_MARKET in s) and (SUPER_ODDS_MARKET in s))].index)
-
-    if not users_both:
-        return df.iloc[0:0].copy(), pd.DataFrame(columns=[
-            "User ID", "User Name",
-            f"Profit: {HDA_MARKET}", f"Profit: {SUPER_ODDS_MARKET}",
-            "Total Profit (User Currency)", "Flagged Events", "Flagged Bets"
-        ])
-
-    df2 = df[df["User ID"].isin(users_both)].copy()
-
-    # Event-level suspicious pattern
+    # Event-level suspicious pattern: HDA contains BOTH home and away
     group_cols = ["User ID", "Event"]
 
     def _event_flag(g: pd.DataFrame) -> bool:
         hda = g[g["Market"] == HDA_MARKET]
-        sup = g[g["Market"] == SUPER_ODDS_MARKET]
-
-        if hda.empty or sup.empty:
+        if hda.empty:
             return False
 
         sides = set(hda["_pick_side"].dropna().tolist())
-        if not (("home" in sides) and ("away" in sides)):
-            return False
-
-        sup_sides = set(sup["_pick_side"].dropna().tolist())
-        if sup_sides:
-            return "draw" in sup_sides
-        return True
+        return ("home" in sides) and ("away" in sides)
 
     flags = (
-        df2.groupby(group_cols, dropna=False)
-           .apply(_event_flag)
-           .rename("Suspicious")
-           .reset_index()
+        df.groupby(group_cols, dropna=False)
+          .apply(_event_flag)
+          .rename("Suspicious")
+          .reset_index()
     )
     suspicious_events = flags[flags["Suspicious"]].copy()
 
     if suspicious_events.empty:
-        return df.iloc[0:0].copy(), pd.DataFrame(columns=[
+        empty_summary = pd.DataFrame(columns=[
             "User ID", "User Name",
             f"Profit: {HDA_MARKET}", f"Profit: {SUPER_ODDS_MARKET}",
             "Total Profit (User Currency)", "Flagged Events", "Flagged Bets"
         ])
+        return df.iloc[0:0].copy(), empty_summary
 
     # Join back to get relevant bets
-    df2 = df2.merge(suspicious_events[group_cols], on=group_cols, how="inner")
+    df2 = df.merge(suspicious_events[group_cols], on=group_cols, how="inner")
 
+    # Keep only bets on the two relevant markets for reporting.
+    # If a user only played HDA, they'll just have HDA rows here.
     suspicious_bets = df2[df2["Market"].isin([HDA_MARKET, SUPER_ODDS_MARKET])].copy()
 
     # Build summary (only Won/Lost contribute; others ignored)
@@ -212,25 +195,33 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
                   .reset_index()
     )
 
-    pivot = prof.pivot_table(index=["User ID", "User Name"], columns="Market", values="Realized Profit (User Currency)", fill_value=0.0)
+    pivot = prof.pivot_table(
+        index=["User ID", "User Name"],
+        columns="Market",
+        values="Realized Profit (User Currency)",
+        fill_value=0.0
+    )
     pivot = pivot.rename(columns={
         HDA_MARKET: f"Profit: {HDA_MARKET}",
         SUPER_ODDS_MARKET: f"Profit: {SUPER_ODDS_MARKET}"
     }).reset_index()
 
+    # ensure profit columns exist even if one market is absent
+    if f"Profit: {HDA_MARKET}" not in pivot.columns:
+        pivot[f"Profit: {HDA_MARKET}"] = 0.0
+    if f"Profit: {SUPER_ODDS_MARKET}" not in pivot.columns:
+        pivot[f"Profit: {SUPER_ODDS_MARKET}"] = 0.0
+
     # add counts
     ev_count = suspicious_events.groupby("User ID")["Event"].nunique().rename("Flagged Events")
     bet_count = suspicious_bets.groupby("User ID")["Bet ID"].nunique().rename("Flagged Bets")
 
-    summary = pivot.merge(ev_count.reset_index(), on="User ID", how="left").merge(bet_count.reset_index(), on="User ID", how="left")
+    summary = (
+        pivot.merge(ev_count.reset_index(), on="User ID", how="left")
+             .merge(bet_count.reset_index(), on="User ID", how="left")
+    )
     summary["Flagged Events"] = summary["Flagged Events"].fillna(0).astype(int)
     summary["Flagged Bets"] = summary["Flagged Bets"].fillna(0).astype(int)
-
-    # ensure missing profit columns exist
-    if f"Profit: {HDA_MARKET}" not in summary.columns:
-        summary[f"Profit: {HDA_MARKET}"] = 0.0
-    if f"Profit: {SUPER_ODDS_MARKET}" not in summary.columns:
-        summary[f"Profit: {SUPER_ODDS_MARKET}"] = 0.0
 
     summary["Total Profit (User Currency)"] = summary[f"Profit: {HDA_MARKET}"] + summary[f"Profit: {SUPER_ODDS_MARKET}"]
     summary = summary.sort_values(["Total Profit (User Currency)"], ascending=False, kind="mergesort")
@@ -267,7 +258,7 @@ st.set_page_config(page_title="Early Settlement ügyeskedők szűrése", layout=
 st.title("Early Settlement ügyeskedők szűrése")
 st.caption(
     "CSV feltöltés -> gyanús felhasználók és fogadások listázása. "
-    "A logika a 'Home Draw Away, Ordinary Time' (Early Settlement) + '3-way (0% margin), Ordinary Time' (Szuper Odds) kombinációt keresi."
+    "A flag most már akkor is jár, ha a felhasználó ugyanazon eseményen a HDA piacon fogad hazaira és vendégre is."
 )
 
 with st.expander("Mit keresünk pontosan?", expanded=False):
@@ -275,9 +266,8 @@ with st.expander("Mit keresünk pontosan?", expanded=False):
         f"""
 - Csak a **{HDA_MARKET}** piacon van Early Settlement.
 - A **{SUPER_ODDS_MARKET}** piacon (Szuper Odds) nincs Early Settlement.
-- Gyanús, ha ugyanazon felhasználó ugyanazon eseményen:
-  - a **{HDA_MARKET}** piacon fogad **hazaira és vendégre is**, és
-  - a **{SUPER_ODDS_MARKET}** piacon fogad (ideálisan döntetlenre).
+- **Gyanús**, ha ugyanazon felhasználó ugyanazon eseményen a **{HDA_MARKET}** piacon fogad **hazaira és vendégre is**.
+- A Szuper Odds fogadás **nem kötelező** a találathoz, de ha jelen van, a riportban látszani fog.
 - Profit számítás:
   - `Settlement status = Won` -> realizált profit = `Possible profit (User Currency)`
   - `Settlement status = Lost` -> realizált profit = 0
