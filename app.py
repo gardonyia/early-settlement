@@ -126,11 +126,12 @@ def realized_profit(row: pd.Series) -> Optional[float]:
 # ----------------------------
 # Core detection logic
 # ----------------------------
-def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, int]:
     """
     Returns:
       suspicious_bets_df: bets belonging to users/events that match the pattern
       summary_df: per-user market profit summary
+      flagged_bets_count: number of distinct Bet IDs in flagged set
 
     Flag rules (event-level, per user):
       - Flag if on the HDA market the user placed BOTH 'home' and 'away' picks
@@ -182,9 +183,9 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
         empty_summary = pd.DataFrame(columns=[
             "User ID", "User Name",
             f"Profit: {HDA_MARKET}", f"Profit: {SUPER_ODDS_MARKET}",
-            "Total Profit (User Currency)", "Flagged Events", "Flagged Bets"
+            "Total Profit (User Currency)", "Flagged Bets"
         ])
-        return df.iloc[0:0].copy(), empty_summary
+        return df.iloc[0:0].copy(), empty_summary, 0
 
     # Join back to get relevant bets
     df2 = df.merge(suspicious_events[group_cols], on=group_cols, how="inner")
@@ -225,15 +226,10 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if f"Profit: {SUPER_ODDS_MARKET}" not in pivot.columns:
         pivot[f"Profit: {SUPER_ODDS_MARKET}"] = 0.0
 
-    # add counts
-    ev_count = suspicious_events.groupby("User ID")["Event"].nunique().rename("Flagged Events")
+    # add counts (per user)
     bet_count = suspicious_bets.groupby("User ID")["Bet ID"].nunique().rename("Flagged Bets")
 
-    summary = (
-        pivot.merge(ev_count.reset_index(), on="User ID", how="left")
-             .merge(bet_count.reset_index(), on="User ID", how="left")
-    )
-    summary["Flagged Events"] = summary["Flagged Events"].fillna(0).astype(int)
+    summary = pivot.merge(bet_count.reset_index(), on="User ID", how="left")
     summary["Flagged Bets"] = summary["Flagged Bets"].fillna(0).astype(int)
 
     summary["Total Profit (User Currency)"] = summary[f"Profit: {HDA_MARKET}"] + summary[f"Profit: {SUPER_ODDS_MARKET}"]
@@ -249,15 +245,19 @@ def detect_suspicious(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     bets_out = suspicious_bets[keep_cols].copy()
     bets_out = bets_out.sort_values(["User ID", "Event", "Market", "Placed Date"], kind="mergesort")
 
-    return bets_out, summary
+    flagged_bets_count = int(suspicious_bets["Bet ID"].nunique()) if "Bet ID" in suspicious_bets.columns else len(suspicious_bets)
+
+    return bets_out, summary, flagged_bets_count
 
 
-def to_excel_bytes(bets_df: pd.DataFrame, summary_df: pd.DataFrame) -> bytes:
+def to_excel_bytes(bets_df: pd.DataFrame, summary_df: pd.DataFrame, raw_df: pd.DataFrame) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="Summary")
         bets_df.to_excel(writer, index=False, sheet_name="Bets")
-        for sheet_name in ["Summary", "Bets"]:
+        raw_df.to_excel(writer, index=False, sheet_name="Raw CSV")
+
+        for sheet_name in ["Summary", "Bets", "Raw CSV"]:
             ws = writer.book[sheet_name]
             ws.freeze_panes = "A2"
     return output.getvalue()
@@ -308,24 +308,31 @@ if uploaded:
     st.subheader("Beolvasott adatok (minta)")
     st.dataframe(df.head(50), use_container_width=True)
 
-    bets_df, summary_df = detect_suspicious(df)
+    bets_df, summary_df, flagged_bets_count = detect_suspicious(df)
 
     st.subheader("Eredmény")
     if summary_df.empty:
         st.info("Nem találtam olyan felhasználót/eseményt, ami megfelel a gyanús mintának ebben a fájlban.")
+        # still allow raw export for convenience
+        xls_bytes = to_excel_bytes(bets_df, summary_df, df)
+        st.download_button(
+            label="Eredmény letöltése (XLSX)",
+            data=xls_bytes,
+            file_name="early_settlement_suspicious_users.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
     else:
         c1, c2 = st.columns([1, 2])
         with c1:
             st.metric("Gyanús felhasználók", int(summary_df["User ID"].nunique()))
-            st.metric("Gyanús események (összesen)", int(summary_df["Flagged Events"].sum()))
-            st.metric("Gyanús fogadások (összesen)", int(summary_df["Flagged Bets"].sum()))
+            st.metric("Gyanús fogadások (összesen)", int(flagged_bets_count))
         with c2:
             st.dataframe(summary_df, use_container_width=True)
 
         st.markdown("**Gyanús fogadások listája (részletek):**")
         st.dataframe(bets_df, use_container_width=True, height=420)
 
-        xls_bytes = to_excel_bytes(bets_df, summary_df)
+        xls_bytes = to_excel_bytes(bets_df, summary_df, df)
         st.download_button(
             label="Eredmény letöltése (XLSX)",
             data=xls_bytes,
